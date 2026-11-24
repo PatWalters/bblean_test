@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Cluster molecular structures using BitBIRCH-Lean (bblean) and identify
-the most similar compound pairs assigned to different clusters.
+Cluster molecular structures using BitBIRCH-Lean (bblean) or RDKit Taylor-Butina
+clustering and identify the most similar compound pairs assigned to different clusters.
 """
 
 import argparse
@@ -10,11 +10,18 @@ import pandas as pd
 import bblean
 import bblean.similarity as iSIM
 from bblean_cluster import bblean_cluster
+from butina_cluster import butina_cluster
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cluster molecules with bblean_cluster and find top cross-cluster similar pairs."
+        description="Cluster molecules (bblean or RDKit Butina) and find top cross-cluster similar pairs."
+    )
+    parser.add_argument(
+        "--method",
+        choices=["bblean", "butina"],
+        default="bblean",
+        help="Clustering algorithm to use: 'bblean' or 'butina' (default: bblean)",
     )
     parser.add_argument(
         "--input",
@@ -33,13 +40,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--clustered-output",
-        default="expansion_train_clustered.csv",
-        help="Path to save the clustered dataset CSV (default: expansion_train_clustered.csv)",
+        default=None,
+        help="Path to save the clustered dataset CSV (default: expansion_train_clustered.csv for bblean, expansion_train_butina_clustered.csv for butina)",
     )
     parser.add_argument(
         "--pairs-output",
-        default="similar_compounds_different_clusters.csv",
-        help="Path to save cross-cluster similar pairs CSV (default: similar_compounds_different_clusters.csv)",
+        default=None,
+        help="Path to save cross-cluster similar pairs CSV (default: similar_compounds_different_clusters.csv for bblean, similar_compounds_different_clusters_butina.csv for butina)",
+    )
+    parser.add_argument(
+        "--butina-dist-thresh",
+        type=float,
+        default=None,
+        help="Tanimoto distance cutoff (1 - similarity) for Butina clustering. If omitted, uses the iSIM-estimated threshold (1 - (mean + 4*std) ~= 0.4805)",
     )
     parser.add_argument(
         "--min-sim",
@@ -61,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print detailed BitBIRCH reclustering progress",
+        help="Print detailed clustering progress",
     )
     return parser.parse_args()
 
@@ -69,25 +82,52 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.clustered_output is None:
+        args.clustered_output = (
+            "expansion_train_clustered.csv"
+            if args.method == "bblean"
+            else "expansion_train_butina_clustered.csv"
+        )
+    if args.pairs_output is None:
+        args.pairs_output = (
+            "similar_compounds_different_clusters.csv"
+            if args.method == "bblean"
+            else "similar_compounds_different_clusters_butina.csv"
+        )
+
     # Load dataset
     df = pd.read_csv(args.input)
     print(f"Loaded {len(df)} molecules from {args.input}")
 
-    # Run BitBIRCH-Lean clustering
-    cluster_ids, _ = bblean_cluster(
-        df,
-        smiles_column=args.smiles_col,
-        n_features=args.n_features,
-        fp_kind=args.fp_kind,
-        verbose=args.verbose,
-    )
+    # Run selected clustering algorithm
+    if args.method == "bblean":
+        cluster_ids, _ = bblean_cluster(
+            df,
+            smiles_column=args.smiles_col,
+            n_features=args.n_features,
+            fp_kind=args.fp_kind,
+            verbose=args.verbose,
+        )
+    else:
+        radius = 2 if args.fp_kind == "ecfp4" else 3
+        cluster_ids, _ = butina_cluster(
+            df,
+            smiles_column=args.smiles_col,
+            n_features=args.n_features,
+            radius=radius,
+            dist_thresh=args.butina_dist_thresh,
+            verbose=args.verbose,
+        )
+
     df["cluster"] = cluster_ids
 
     n_clusters = df["cluster"].nunique()
     cluster_sizes = df["cluster"].value_counts().to_dict()
     n_singletons = sum(1 for size in cluster_sizes.values() if size == 1)
 
-    print(f"Clustering complete: {n_clusters} clusters ({n_singletons} singletons)")
+    print(
+        f"[{args.method.upper()}] Clustering complete: {n_clusters} clusters ({n_singletons} singletons)"
+    )
     df.to_csv(args.clustered_output, index=False)
     print(f"Saved clustered dataset to {args.clustered_output}")
 
@@ -142,7 +182,7 @@ def main() -> None:
     )
 
     if not pairs_df.empty:
-        print("\nTop 10 Most Similar Pairs in Different Clusters:")
+        print(f"\nTop 10 Most Similar Pairs in Different Clusters ({args.method.upper()}):")
         cols_to_show = [
             "Rank",
             "Tanimoto_Similarity",
